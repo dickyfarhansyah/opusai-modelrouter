@@ -1148,8 +1148,11 @@ async def execute_rerank(request: RerankRequest, idempotent_key:Optional[str]=No
     if idempotent_key in completed:
         logger.info(f'[IDEMPOTENT] Cache hit in rerank for key {idempotent_key}, returning cached result')
         result = completed.get(idempotent_key, None)
-        if result:
+        if result and not isinstance(result, Exception):
             return result
+        else:
+            raise result
+        
         
     event = None
     is_processor = False
@@ -1238,15 +1241,21 @@ async def _proxy_embeddings(request: Request, idempotency_key: Optional[str]=Non
     if not idempotency_key:
         idempotency_key = str(uuid.uuid4())
 
+    if idempotency_key in completed:
+        logger.info(f'[IDEMPOTENT] Cache hit in embedding for key {idempotency_key}')
+        result = completed.get(idempotency_key, None)
+        if result and not isinstance(result, Exception):
+            return result
+        else:
+            raise result
+        
+    event = None
+    is_processor = False
     async with IDEMPOTENT_EMBEDDING_LOCK:
-        if idempotency_key in completed:
-            logger.info(f'[IDEMPOTENT] Cache hit for key {idempotency_key}, returning cached result')
-            return completed[idempotency_key]
         logger.info('[IDEMPOTENT] Cache miss, checking for new request')
         if idempotency_key in inflight_request:
             logger.info('[IDEMPOTENT] Idempotent request detected')
             event = inflight_request[idempotency_key]
-            is_processor = False
         else:
             logger.info(f'[IDEMPOTENT] New request with key {idempotency_key}')
             event = asyncio.Event()
@@ -1255,13 +1264,27 @@ async def _proxy_embeddings(request: Request, idempotency_key: Optional[str]=Non
 
     if not is_processor:
         logger.info('[IDEMPOTENT] Waiting for original request to finish')
-        await event.wait()
+        
+        try:
+            await event.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error('Unexpected error in embedding proxy', exc_info=e)
+            raise
 
-        async with IDEMPOTENT_EMBEDDING_LOCK:
-            if idempotency_key in completed:
-                return completed[idempotency_key]
-            else:
-                raise RuntimeError('Original request failed')
+        # async with IDEMPOTENT_EMBEDDING_LOCK:
+        #     if idempotency_key in completed:
+        #         return completed[idempotency_key]
+        #     else:
+        #         raise RuntimeError('Original request failed')
+        if idempotency_key in completed:
+            return completed[idempotency_key]
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail='Original request processing failed'
+            )
             
     try:
 
@@ -1375,6 +1398,12 @@ async def _proxy_embeddings(request: Request, idempotency_key: Optional[str]=Non
             event = inflight_request[idempotency_key]
             if event:
                 event.set()
+            inflight_request.pop(idempotency_key, None)
+
+        assign_to_background(clean_completed_task(idempotency_key, delay=180))
+        return all_embeddings
+            # if event:
+            #     event.set()
 
         assign_to_background(clean_completed_task(idempotency_key, delay=1800))
 
@@ -2020,7 +2049,8 @@ async def proxy_embeddings(request: Request, idempotent_key: Optional[str] = Hea
         return response
     except Exception:
         async with IDEMPOTENT_EMBEDDING_LOCK:
-            event = inflight_request.get(idempotent_key)
+            # event = inflight_request.get(idempotent_key)
+            event = inflight_request.pop(idempotent_key, None)
             if event:
                 event.set()
         raise
