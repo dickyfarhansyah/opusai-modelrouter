@@ -1393,32 +1393,40 @@ async def _proxy_embeddings(request: Request, idempotency_key: Optional[str]=Non
             # Estimate tokens (rough: ~1 token per 4 chars)
             total_tokens += len(text) // 4
 
+
+        request.state.queue_time = time.time() - queue_start
+        request.state.tokens_generated = 0  # Embeddings don't generate tokens
+
+        result_content = {
+            'object': 'list',
+            'data': all_embeddings,
+            'model': model_alias,
+            'usage': {'prompt_tokens': total_tokens, 'total_tokens': total_tokens}
+        }
         async with IDEMPOTENT_EMBEDDING_LOCK:
-            completed[idempotency_key] = all_embeddings
+            completed[idempotency_key] = result_content
             event = inflight_request[idempotency_key]
             if event:
                 event.set()
             inflight_request.pop(idempotency_key, None)
 
         assign_to_background(clean_completed_task(idempotency_key, delay=180))
-        return all_embeddings
+        return result_content
             # if event:
             #     event.set()
 
-        assign_to_background(clean_completed_task(idempotency_key, delay=1800))
+        # assign_to_background(clean_completed_task(idempotency_key, delay=1800))
 
-        request.state.queue_time = time.time() - queue_start
-        request.state.tokens_generated = 0  # Embeddings don't generate tokens
 
-        # Return OpenAI-compatible format
-        return JSONResponse(
-            content={
-                "object": "list",
-                "data": all_embeddings,
-                "model": model_alias,
-                "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
-            }
-        )
+        # # Return OpenAI-compatible format
+        # return JSONResponse(
+        #     content={
+        #         "object": "list",
+        #         "data": all_embeddings,
+        #         "model": model_alias,
+        #         "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
+        #     }
+        # )
 
     except LookupError as e:
         logger.error(f"Model tidak ditemukan: {e}")
