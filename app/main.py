@@ -2,6 +2,7 @@ import os
 import json
 import time
 import uuid
+import math
 import httpx
 import heapq
 import pynvml
@@ -1141,6 +1142,9 @@ async def _proxy_request_with_queue(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail
         )
     
+def sigmoid_activation(value):
+    return 1 / (1 + math.exp(-value))
+    
 async def execute_rerank(request: RerankRequest, idempotent_key:Optional[str]=None):
     if not idempotent_key:
         idempotent_key = str(uuid.uuid4())
@@ -1205,9 +1209,22 @@ async def execute_rerank(request: RerankRequest, idempotent_key:Optional[str]=No
         )
 
         response = await http_client.send(req)
-        response.raise_for_status()
+        # response.raise_for_status()
+
+        if response.status_code != 200:
+            logger.error(f'traceback : {response.json()}')
+            # raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            #         detail='Something went wrong, please try again later.')
+            raise Exception
 
         result = response.json()
+        
+        if result.get('results', None):
+            for item in result['results']:
+                item['relevance_score'] = sigmoid_activation(item['relevance_score'])
+                # item["relevance_percentage"] = round(score * 100, 2)
+        else:
+            raise Exception
 
         async with IDEMPOTENT_RERANK_LOCK:
             completed[idempotent_key] = result
@@ -1221,17 +1238,22 @@ async def execute_rerank(request: RerankRequest, idempotent_key:Optional[str]=No
         
 
     except HTTPException:
-        async with IDEMPOTENT_RERANK_LOCK:
-            event.set()
-            inflight_request.pop(idempotent_key, None)
+        # async with IDEMPOTENT_RERANK_LOCK:
+        #     event.set()
+        #     inflight_request.pop(idempotent_key, None)
         raise
-    except Exception as e:
-        logger.error('Failed to compute rerank', exc_info=e)
-        async with IDEMPOTENT_RERANK_LOCK:
-            event.set()
-            inflight_request.pop(idempotent_key, None)
+    except Exception:
+        # logger.error('Failed to compute rerank', exc_info=e)
+        logger.exception('Failed to compute rerank')
+        # async with IDEMPOTENT_RERANK_LOCK:
+        #     event.set()
+        #     inflight_request.pop(idempotent_key, None)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                             detail='Something went wrong, please try again later.')
+    finally:
+        async with IDEMPOTENT_RERANK_LOCK:
+            event.set()
+            inflight_request.pop(idempotent_key, None)
 
 
 async def _proxy_embeddings(request: Request, idempotency_key: Optional[str]=None):
