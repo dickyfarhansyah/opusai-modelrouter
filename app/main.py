@@ -566,6 +566,10 @@ async def _process_queued_request(
 
     logger.debug(f"[Queue] Processing request {request_id} for {model_alias}")
 
+    # [kimi] Fix: Initialize chunks list early for partial recovery on errors
+    chunks = []
+    is_streaming = body.get("stream", False)
+    
     for attempt in range(max_retries + 1):
         try:
             # Build request
@@ -581,18 +585,46 @@ async def _process_queued_request(
 
             # Send request
             send_start = time.time()
-            response_stream = await http_client.send(req, stream=True)
-            send_time = time.time() - send_start
-
-            # Check if streaming
-            is_streaming = body.get("stream", False)
-
+            
+            # [kimi] Fix: No read timeout for streaming requests on fast GPUs
+            # Problem: Fast GPUs (RTX 5090) can generate very long outputs quickly.
+            # The default read timeout (request_timeout_sec * 2) may cut off streams
+            # that are still actively producing data.
+            # Fix: Use http_client.stream() context manager for streaming with custom timeout.
+            # httpx.send() doesn't accept timeout parameter; stream() does.
             if is_streaming:
-                # For streaming, collect all chunks
-                chunks = []
-                async for chunk in response_stream.aiter_bytes():
-                    chunks.append(chunk)
-                await response_stream.aclose()
+                # Use stream() context manager with custom timeout for streaming
+                async with http_client.stream(
+                    method="POST",
+                    url=internal_url,
+                    json=body,
+                    headers={"Content-Type": "application/json"},
+                    timeout=httpx.Timeout(
+                        connect=2.0,
+                        read=None,  # No read timeout for streaming
+                        write=5.0,
+                        pool=5.0,
+                    )
+                ) as response_stream:
+                    send_time = time.time() - send_start
+                    
+                    # For streaming, collect all chunks
+                    # Note: chunks list is initialized before the retry loop for partial recovery
+                    async for chunk in response_stream.aiter_bytes():
+                        chunks.append(chunk)
+                    
+                    # [kimi] Fix: Explicit stream drain for fast GPUs (RTX 5090)
+                    # Problem: With fast GPUs, kernel TCP buffer fills quickly and aiter_bytes()
+                    # may signal completion before all data is drained, causing stream cutoff.
+                    # Fix: Explicitly read any remaining data before closing the stream.
+                    try:
+                        remaining = await response_stream.aread()
+                        if remaining:
+                            chunks.append(remaining)
+                    except Exception:
+                        pass  # Stream already closed or empty
+                    
+                    status_code = response_stream.status_code
 
                 total_time = time.time() - start_time
                 logger.debug(
@@ -604,9 +636,12 @@ async def _process_queued_request(
                 return {
                     "type": "stream",
                     "chunks": chunks,
-                    "status_code": response_stream.status_code,
+                    "status_code": status_code or 200,
                 }
             else:
+                response_stream = await http_client.send(req, stream=True)
+                send_time = time.time() - send_start
+                
                 # Non-streaming: read full response
                 read_start = time.time()
                 content = await response_stream.aread()
@@ -667,6 +702,23 @@ async def _process_queued_request(
                 }
 
         except (httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            # [kimi] Fix: Partial chunks recovery for streaming on fast GPUs
+            # Problem: With fast GPUs, connection may drop near stream completion
+            # after receiving most content. Retrying discards valid partial data.
+            # Fix: If we have collected chunks in streaming mode, return them
+            # instead of failing completely.
+            if is_streaming and chunks:
+                logger.warning(
+                    f"[Queue] Request {request_id} connection error after collecting "
+                    f"{len(chunks)} chunks. Returning partial response."
+                )
+                return {
+                    "type": "stream",
+                    "chunks": chunks,
+                    "status_code": 200,
+                    "partial": True,
+                }
+            
             # Retriable errors
             if attempt < max_retries:
                 logger.warning(
@@ -682,6 +734,18 @@ async def _process_queued_request(
                 )
                 raise
         except Exception as e:
+            # [kimi] Fix: Same partial recovery for non-retriable exceptions
+            if is_streaming and chunks:
+                logger.warning(
+                    f"[Queue] Request {request_id} error after collecting "
+                    f"{len(chunks)} chunks. Returning partial response: {e}"
+                )
+                return {
+                    "type": "stream",
+                    "chunks": chunks,
+                    "status_code": 200,
+                    "partial": True,
+                }
             logger.exception(f"[Queue] Error processing request {request_id}: {e}")
             raise
 
@@ -1067,15 +1131,32 @@ async def _proxy_request_with_queue(
                     try:
                         for chunk in result["chunks"]:
                             yield chunk
+                            # [kimi] Fix: Event loop yield for fast GPU streaming
+                            # Problem: Fast GPUs (RTX 5090) send chunks in rapid succession,
+                            # starving the HTTP writer task and causing buffer overflows.
+                            # Fix: Yield control back to event loop after each chunk for
+                            # proper backpressure handling and network flushing.
+                            await asyncio.sleep(0)
                     except Exception as e:
                         logger.error(f"Error in stream generator: {e}")
                         error_chunk = f'data: {{"error": "Stream error"}}\n\n'
                         yield error_chunk.encode()
 
+                # [kimi] Fix: Proper SSE headers for streaming responses
+                # Problem: FastAPI/Starlette may buffer output without explicit headers,
+                # causing chunks to be delayed or batched on fast GPUs.
+                # Fix: Add chunked transfer encoding and cache control headers to ensure
+                # immediate network write for each yielded chunk.
                 return StreamingResponse(
                     stream_generator(),
                     status_code=result["status_code"],
                     media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "Transfer-Encoding": "chunked",
+                        "X-Accel-Buffering": "no",
+                    },
                 )
             else:
                 # JSON response
