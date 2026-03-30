@@ -1,8 +1,8 @@
 # RouterModelCustom API Documentation
 
-> **Version:** 1.0.0  
+> **Version:** 1.1.0  
 > **Base URL:** `http://localhost:8000`  
-> **Last Updated:** December 2025
+> **Last Updated:** March 2026
 
 ---
 
@@ -10,11 +10,13 @@
 
 - [Overview](#overview)
 - [Authentication](#authentication)
+- [Common Headers](#common-headers)
 - [Common Response Formats](#common-response-formats)
 - [Error Handling](#error-handling)
 - [OpenAI-Compatible Endpoints](#openai-compatible-endpoints)
   - [POST /v1/chat/completions](#post-v1chatcompletions)
   - [POST /v1/embeddings](#post-v1embeddings)
+  - [POST /v1/rerank](#post-v1rerank)
   - [GET /v1/models](#get-v1models)
 - [Model Management](#model-management)
   - [POST /v1/models/eject](#post-v1modelseject)
@@ -24,8 +26,10 @@
   - [GET /v1/models/status](#get-v1modelsstatus)
   - [GET /v1/models/status/stream](#get-v1modelsstatusstream)
 - [Health & Monitoring](#health--monitoring)
+  - [GET /ping](#get-ping)
   - [GET /health](#get-health)
   - [GET /metrics](#get-metrics)
+  - [GET /metrics/legacy](#get-metricslegacy)
   - [GET /metrics/stream](#get-metricsstream)
   - [GET /metrics/report](#get-metricsreport)
   - [GET /v1/telemetry/summary](#get-v1telemetrysummary)
@@ -46,6 +50,8 @@ RouterModelCustom provides an OpenAI-compatible API layer for managing multiple 
 - **Priority-based request queuing** for fair resource distribution
 - **VRAM management** to prevent out-of-memory errors
 - **Real-time monitoring** via SSE streams and Prometheus metrics
+- **Idempotent requests** to prevent duplicate processing
+- **Reranking support** for document relevance scoring
 
 All inference endpoints are designed to be drop-in replacements for OpenAI's API, allowing existing applications to seamlessly switch to local models.
 
@@ -54,6 +60,26 @@ All inference endpoints are designed to be drop-in replacements for OpenAI's API
 ## Authentication
 
 Currently, the API does not require authentication. For production deployments, it is recommended to place the router behind a reverse proxy (nginx, Traefik) with authentication middleware.
+
+---
+
+## Common Headers
+
+### Request Headers
+
+| Header                | Type   | Required | Description                                                     |
+| --------------------- | ------ | -------- | --------------------------------------------------------------- |
+| `Content-Type`        | string | Yes      | Must be `application/json`                                      |
+| `X-Request-Priority`  | string | No       | Request priority: `high`, `normal`, or `low`. Default: `normal` |
+| `X-Idempotency-Key`   | string | No       | Unique key for idempotent request deduplication (UUID format)   |
+
+### Request Priority Levels
+
+| Priority | Value | Use Case                             |
+| -------- | ----- | ------------------------------------ |
+| `high`   | 1     | Real-time chat, user-facing requests |
+| `normal` | 2     | Default priority for most requests   |
+| `low`    | 3     | Batch processing, background jobs    |
 
 ---
 
@@ -123,10 +149,11 @@ Generate chat completions from a language model. Supports both streaming and non
 
 #### Request Headers
 
-| Header               | Type   | Required | Description                                                     |
-| -------------------- | ------ | -------- | --------------------------------------------------------------- |
-| `Content-Type`       | string | Yes      | Must be `application/json`                                      |
-| `X-Request-Priority` | string | No       | Request priority: `high`, `normal`, or `low`. Default: `normal` |
+| Header                | Type   | Required | Description                                                     |
+| --------------------- | ------ | -------- | --------------------------------------------------------------- |
+| `Content-Type`        | string | Yes      | Must be `application/json`                                      |
+| `X-Request-Priority`  | string | No       | Request priority: `high`, `normal`, or `low`. Default: `normal` |
+| `X-Idempotency-Key`   | string | No       | Unique key for request deduplication (30-min cache)             |
 
 #### Request Body
 
@@ -153,6 +180,7 @@ Generate chat completions from a language model. Supports both streaming and non
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "X-Request-Priority: high" \
+  -H "X-Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
   -d '{
     "model": "qwen-7b",
     "messages": [
@@ -225,6 +253,13 @@ If the conversation exceeds the model's context window, the response includes a 
 
 Generate vector embeddings for input text. The target model must have `embedding: true` set in configuration.
 
+#### Request Headers
+
+| Header                | Type   | Required | Description                                                     |
+| --------------------- | ------ | -------- | --------------------------------------------------------------- |
+| `Content-Type`        | string | Yes      | Must be `application/json`                                      |
+| `X-Idempotency-Key`   | string | No       | Unique key for request deduplication (30-min cache)             |
+
 #### Request Body
 
 | Field   | Type         | Required | Description                     |
@@ -237,6 +272,7 @@ Generate vector embeddings for input text. The target model must have `embedding
 ```bash
 curl -X POST http://localhost:8000/v1/embeddings \
   -H "Content-Type: application/json" \
+  -H "X-Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
   -d '{
     "model": "bge-large",
     "input": ["Hello world", "Goodbye world"]
@@ -267,6 +303,70 @@ curl -X POST http://localhost:8000/v1/embeddings \
   }
 }
 ```
+
+---
+
+### POST /v1/rerank
+
+Rerank documents based on relevance to a query. The target model must have `reranker: true` set in configuration. Scores are transformed using sigmoid activation to produce normalized relevance scores between 0 and 1.
+
+#### Request Headers
+
+| Header                | Type   | Required | Description                                                     |
+| --------------------- | ------ | -------- | --------------------------------------------------------------- |
+| `Content-Type`        | string | Yes      | Must be `application/json`                                      |
+| `X-Idempotency-Key`   | string | No       | Unique key for request deduplication (30-min cache)             |
+
+#### Request Body
+
+| Field       | Type          | Required | Description                                                |
+| ----------- | ------------- | -------- | ---------------------------------------------------------- |
+| `model`     | string        | Yes      | Alias of the reranker model                                |
+| `query`     | string        | Yes      | The query text to compare documents against                |
+| `documents` | array[string] | Yes      | Array of document strings to be ranked                     |
+| `top_n`     | integer       | Yes      | Maximum number of top results to return                    |
+
+#### Request Example
+
+```bash
+curl -X POST http://localhost:8000/v1/rerank \
+  -H "Content-Type: application/json" \
+  -H "X-Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
+  -d '{
+    "model": "bge-reranker",
+    "query": "What is machine learning?",
+    "documents": [
+      "Machine learning is a subset of artificial intelligence...",
+      "The capital of France is Paris.",
+      "Deep learning uses neural networks with multiple layers..."
+    ],
+    "top_n": 2
+  }'
+```
+
+#### Response
+
+```json
+{
+  "results": [
+    {
+      "index": 0,
+      "relevance_score": 0.89
+    },
+    {
+      "index": 2,
+      "relevance_score": 0.76
+    }
+  ]
+}
+```
+
+#### Error Responses
+
+| Status Code | Description                                                     |
+|-------------|-----------------------------------------------------------------|
+| `400`       | Model not found or model does not support reranking             |
+| `500`       | Internal error during reranking computation                     |
 
 ---
 
@@ -588,6 +688,26 @@ Endpoints for monitoring server health, performance metrics, and request telemet
 
 ---
 
+### GET /ping
+
+Simple serverless ping check for load balancers and health probes. Returns immediately without checking dependencies.
+
+#### Request Example
+
+```bash
+curl http://localhost:8000/ping
+```
+
+#### Response
+
+```json
+{
+  "status": "ok"
+}
+```
+
+---
+
 ### GET /health
 
 Comprehensive health check for the router and its dependencies.
@@ -677,6 +797,30 @@ router_queue_depth{model="qwen-7b"} 5
 # HELP router_models_loaded Number of models currently loaded
 # TYPE router_models_loaded gauge
 router_models_loaded 2
+```
+
+---
+
+### GET /metrics/legacy
+
+Legacy metrics endpoint (old format). Use `/metrics` for Prometheus format.
+
+#### Request Example
+
+```bash
+curl http://localhost:8000/metrics/legacy
+```
+
+#### Response (Text Format)
+
+```
+requests_total{endpoint="/v1/chat/completions"} 1234
+requests_success{endpoint="/v1/chat/completions"} 1222
+requests_failed{endpoint="/v1/chat/completions"} 12
+request_duration_seconds_avg{endpoint="/v1/chat/completions"} 0.4521
+request_duration_seconds_p95{endpoint="/v1/chat/completions"} 1.2345
+models_loaded_total 2
+models_ejected_total 5
 ```
 
 ---
@@ -1037,6 +1181,25 @@ Use the `X-Request-Priority` header to influence queue ordering:
 | `normal` | Default priority for most requests   |
 | `low`    | Batch processing, background jobs    |
 
+### Idempotency Keys
+
+For requests that must not be processed multiple times (e.g., billing-critical operations), use the `X-Idempotency-Key` header:
+
+- Provide a unique UUID for each distinct operation
+- The router caches responses for 30 minutes
+- Duplicate requests with the same key return the cached response
+- Applies to `/v1/chat/completions`, `/v1/embeddings`, and `/v1/rerank`
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
+  -d '{
+    "model": "qwen-7b",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
 ### Handling Backpressure
 
 When the queue is full, the API returns HTTP 503. Clients should implement exponential backoff:
@@ -1071,6 +1234,15 @@ For streaming responses, ensure your client properly handles Server-Sent Events 
 ---
 
 ## Changelog
+
+### v1.1.0 (March 2026)
+
+- Added `/v1/rerank` endpoint for document reranking
+- Added `X-Idempotency-Key` header support for deduplication
+- Added `/ping` endpoint for simple health checks
+- Added `/metrics/legacy` endpoint for backward compatibility
+- Improved streaming response handling for fast GPUs
+- Enhanced error recovery with partial chunk support
 
 ### v1.0.0 (December 2025)
 
