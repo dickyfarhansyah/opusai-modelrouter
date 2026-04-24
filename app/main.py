@@ -2132,7 +2132,7 @@ async def get_queue_stats():
 @app.post("/v1/chat/completions")
 async def proxy_chat_completions(
     request: Request,
-    idempotent_key: Optional[str] = Header(uuid.uuid4(), alias="X-Idempotency-Key"),
+    idempotent_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
     """
     Chat completions dengan request queue system.
@@ -2150,7 +2150,7 @@ async def proxy_chat_completions(
 
 
 @app.post("/v1/embeddings")
-async def proxy_embeddings(request: Request, idempotent_key: Optional[str] = Header(uuid.uuid4(), alias="X-Idempotency-Key")):
+async def proxy_embeddings(request: Request, idempotent_key: Optional[str] = Header(None, alias="X-Idempotency-Key")):
     """
     Embeddings.
     """
